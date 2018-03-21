@@ -15,4 +15,6 @@
 
 ps_brand=bhyve
 
+jst_ufpromisc="yes"
+
 . /usr/lib/brand/jcommon/statechange
