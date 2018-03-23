@@ -128,6 +128,9 @@
 #define	VIONA_PROBE_BAD_RING_ADDR(r, a)		\
 	VIONA_PROBE2(bad_ring_addr, viona_vring_t *, r, void *, (void *)(a))
 
+#define	VIONA_RING_STAT_INCR(r, name)	\
+	(((r)->vr_stats.rs_ ## name)++)
+
 #pragma pack(1)
 struct virtio_desc {
 	uint64_t	vd_addr;
@@ -219,6 +222,29 @@ typedef struct viona_vring {
 	volatile uint16_t		*vr_used_idx;
 	volatile struct virtio_used	*vr_used_ring;
 	volatile uint16_t		*vr_used_avail_event;
+
+	/* Per-ring error condition statistics */
+	struct viona_ring_stats {
+		uint64_t	rs_ndesc_too_high;
+		uint64_t	rs_bad_idx;
+		uint64_t	rs_indir_bad_len;
+		uint64_t	rs_indir_bad_nest;
+		uint64_t	rs_indir_bad_next;
+		uint64_t	rs_no_space;
+		uint64_t	rs_too_many_desc;
+
+		uint64_t	rs_bad_ring_addr;
+
+		uint64_t	rs_fail_hcksum;
+		uint64_t	rs_fail_hcksum6;
+		uint64_t	rs_fail_hcksum_proto;
+
+		uint64_t	rs_bad_rx_frame;
+		uint64_t	rs_rx_merge_overrun;
+		uint64_t	rs_rx_merge_underrun;
+		uint64_t	rs_too_short;
+		uint64_t	rs_tx_absent;
+	} vr_stats;
 } viona_vring_t;
 
 struct viona_link {
@@ -907,6 +933,9 @@ viona_ioc_ring_init(viona_link_t *link, void *udata, int md)
 	ring->vr_msi_addr = 0;
 	ring->vr_msi_msg = 0;
 
+	/* Clear the stats */
+	bzero(&ring->vr_stats, sizeof (ring->vr_stats));
+
 	t = viona_create_worker(ring);
 	if (t == NULL) {
 		err = ENOMEM;
@@ -1324,6 +1353,7 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 	if (ndesc > ring->vr_size) {
 		VIONA_PROBE2(ndesc_too_high, viona_vring_t *, ring,
 		    uint16_t, ndesc);
+		VIONA_RING_STAT_INCR(ring, ndesc_too_high);
 		mutex_exit(&ring->vr_a_mutex);
 		return (-1);
 	}
@@ -1335,6 +1365,7 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 		if (next >= ring->vr_size) {
 			VIONA_PROBE2(bad_idx, viona_vring_t *, ring,
 			    uint16_t, next);
+			VIONA_RING_STAT_INCR(ring, bad_idx);
 			goto bail;
 		}
 
@@ -1343,6 +1374,7 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 			buf = viona_gpa2kva(link, vdir.vd_addr, vdir.vd_len);
 			if (buf == NULL) {
 				VIONA_PROBE_BAD_RING_ADDR(ring, vdir.vd_addr);
+				VIONA_RING_STAT_INCR(ring, bad_ring_addr);
 				goto bail;
 			}
 			iov[i].iov_base = buf;
@@ -1356,11 +1388,13 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 				VIONA_PROBE2(indir_bad_len,
 				    viona_vring_t *, ring,
 				    uint32_t, vdir.vd_len);
+				VIONA_RING_STAT_INCR(ring, indir_bad_len);
 				goto bail;
 			}
 			vindir = viona_gpa2kva(link, vdir.vd_addr, vdir.vd_len);
 			if (vindir == NULL) {
 				VIONA_PROBE_BAD_RING_ADDR(ring, vdir.vd_addr);
+				VIONA_RING_STAT_INCR(ring, bad_ring_addr);
 				goto bail;
 			}
 			next = 0;
@@ -1379,6 +1413,8 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 				if (vp.vd_flags & VRING_DESC_F_INDIRECT) {
 					VIONA_PROBE1(indir_bad_nest,
 					    viona_vring_t *, ring);
+					VIONA_RING_STAT_INCR(ring,
+					    indir_bad_nest);
 					goto bail;
 				}
 				buf = viona_gpa2kva(link, vp.vd_addr,
@@ -1386,6 +1422,8 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 				if (buf == NULL) {
 					VIONA_PROBE_BAD_RING_ADDR(ring,
 					    vp.vd_addr);
+					VIONA_RING_STAT_INCR(ring,
+					    bad_ring_addr);
 					goto bail;
 				}
 				iov[i].iov_base = buf;
@@ -1404,6 +1442,8 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 					    viona_vring_t *, ring,
 					    uint16_t, next,
 					    uint_t, nindir);
+					VIONA_RING_STAT_INCR(ring,
+					    indir_bad_next);
 					goto bail;
 				}
 			}
@@ -1418,6 +1458,7 @@ vq_popchain(viona_vring_t *ring, struct iovec *iov, int niov, uint16_t *cookie)
 
 loopy:
 	VIONA_PROBE1(too_many_desc, viona_vring_t *, ring);
+	VIONA_RING_STAT_INCR(ring, too_many_desc);
 bail:
 	mutex_exit(&ring->vr_a_mutex);
 	return (-1);
@@ -1590,6 +1631,7 @@ viona_recv_plain(viona_vring_t *ring, const mblk_t *mp, size_t msz)
 		VIONA_PROBE5(too_short, viona_vring_t *, ring,
 		    uint16_t, cookie, mblk_t *, mp, size_t, copied,
 		    size_t, msz);
+		VIONA_RING_STAT_INCR(ring, too_short);
 		goto bad_frame;
 	}
 
@@ -1615,6 +1657,8 @@ viona_recv_plain(viona_vring_t *ring, const mblk_t *mp, size_t msz)
 bad_frame:
 	VIONA_PROBE3(bad_rx_frame, viona_vring_t *, ring, uint16_t, cookie,
 	    mblk_t *, mp);
+	VIONA_RING_STAT_INCR(ring, bad_rx_frame);
+
 	vq_pushchain(ring, MAX(copied, MIN_BUF_SIZE + hdr_sz), cookie);
 	return (EINVAL);
 }
@@ -1636,6 +1680,7 @@ viona_recv_merged(viona_vring_t *ring, const mblk_t *mp, size_t msz)
 	if (n <= 0) {
 		/* Without available buffers, the frame must be dropped. */
 		VIONA_PROBE2(no_space, viona_vring_t *, ring, mblk_t *, mp);
+		VIONA_RING_STAT_INCR(ring, no_space);
 		return (ENOSPC);
 	}
 	if (iov[0].iov_len < hdr_sz) {
@@ -1729,6 +1774,7 @@ viona_recv_merged(viona_vring_t *ring, const mblk_t *mp, size_t msz)
 		VIONA_PROBE5(too_short, viona_vring_t *, ring,
 		    uint16_t, cookie, mblk_t *, mp, size_t, copied,
 		    size_t, msz);
+		VIONA_RING_STAT_INCR(ring, too_short);
 		err = (err == 0) ? EINVAL : err;
 	}
 
@@ -1752,16 +1798,19 @@ done:
 	case EMSGSIZE:
 		VIONA_PROBE3(rx_merge_underrun, viona_vring_t *, ring,
 		    uint16_t, cookie, mblk_t *, mp);
+		VIONA_RING_STAT_INCR(ring, rx_merge_underrun);
 		break;
 
 	case EOVERFLOW:
 		VIONA_PROBE3(rx_merge_overrun, viona_vring_t *, ring,
 		    uint16_t, cookie, mblk_t *, mp);
+		VIONA_RING_STAT_INCR(ring, rx_merge_overrun);
 		break;
 
 	default:
 		VIONA_PROBE3(bad_rx_frame, viona_vring_t *, ring,
 		    uint16_t, cookie, mblk_t *, mp);
+		VIONA_RING_STAT_INCR(ring, bad_rx_frame);
 	}
 	vq_pushchain_mrgrx(ring, buf_idx + 1, uelem);
 	return (err);
@@ -1905,9 +1954,10 @@ viona_desb_release(viona_desb_t *dp)
 }
 
 static boolean_t
-viona_tx_csum(viona_link_t *link, const struct virtio_net_hdr *hdr,
+viona_tx_csum(viona_vring_t *ring, const struct virtio_net_hdr *hdr,
     mblk_t *mp, uint32_t len)
 {
+	viona_link_t *link = ring->vr_link;
 	const struct ether_header *eth;
 	uint_t eth_len = sizeof (struct ether_header);
 	ushort_t ftype;
@@ -1960,6 +2010,7 @@ viona_tx_csum(viona_link_t *link, const struct virtio_net_hdr *hdr,
 
 		/* XXX: Implement manual fallback checksumming? */
 		VIONA_PROBE2(fail_hcksum, viona_link_t *, link, mblk_t *, mp);
+		VIONA_RING_STAT_INCR(ring, fail_hcksum);
 		return (B_FALSE);
 	} else if (ftype == ETHERTYPE_IPV6) {
 		if ((link->l_cap_csum & HCKSUM_INET_FULL_V6) != 0) {
@@ -1969,11 +2020,13 @@ viona_tx_csum(viona_link_t *link, const struct virtio_net_hdr *hdr,
 
 		/* XXX: Implement manual fallback checksumming? */
 		VIONA_PROBE2(fail_hcksum6, viona_link_t *, link, mblk_t *, mp);
+		VIONA_RING_STAT_INCR(ring, fail_hcksum6);
 		return (B_FALSE);
 	}
 
 	/* Cannot even emulate hcksum for unrecognized protocols */
 	VIONA_PROBE2(fail_hcksum_proto, viona_link_t *, link, mblk_t *, mp);
+	VIONA_RING_STAT_INCR(ring, fail_hcksum_proto);
 	return (B_FALSE);
 }
 
@@ -1994,6 +2047,7 @@ viona_tx(viona_link_t *link, viona_vring_t *ring)
 	n = vq_popchain(ring, iov, VTNET_MAXSEGS, &cookie);
 	if (n <= 0) {
 		VIONA_PROBE1(tx_absent, viona_vring_t *, ring);
+		VIONA_RING_STAT_INCR(ring, tx_absent);
 		return;
 	}
 
@@ -2053,7 +2107,7 @@ viona_tx(viona_link_t *link, viona_vring_t *ring)
 	/* Request hardware checksumming, if necessary */
 	if ((link->l_features & VIRTIO_NET_F_CSUM) != 0 &&
 	    (hdr->vrh_flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) != 0) {
-		if (!viona_tx_csum(link, hdr, mp_head, len - iov[0].iov_len)) {
+		if (!viona_tx_csum(ring, hdr, mp_head, len - iov[0].iov_len)) {
 			goto drop_fail;
 		}
 	}
