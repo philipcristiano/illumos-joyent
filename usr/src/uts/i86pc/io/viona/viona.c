@@ -1703,6 +1703,7 @@ viona_recv_merged(viona_vring_t *ring, const mblk_t *mp, size_t msz)
 				 * drop the packet.
 				 */
 				err = EMSGSIZE;
+				break;
 			}
 			chunk = 0;
 			i = 0;
